@@ -16,7 +16,7 @@ import tkinter as tk
 
 import serial
 
-SEND_MS = 50
+SEND_MS = 12
 POLL_MS = 20
 # On some platforms key repeat sends release+press pairs; a release only
 # counts if no press follows within this time.

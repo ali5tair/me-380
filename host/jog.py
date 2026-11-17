@@ -2,9 +2,9 @@
 
 Arrows jog X/Y along the base plate edges (Up = the plate's forward
 direction) for as long as they are held, W/S jog Z, F flips the elbow, O/C open and close the gripper,
-Space stops, H homes Z. Keys only act while this
-window has focus; losing focus stops the arm. Close the PlatformIO serial
-monitor first, it holds the port.
+H homes Z. Space toggles a latched stop: while stopped every motion key is
+ignored. Keys only act while this window has focus; losing focus stops the
+arm. Close the PlatformIO serial monitor first, it holds the port.
 
     .venv\\Scripts\\python host\\jog.py [--port COM7]
 """
@@ -44,9 +44,18 @@ class Jog:
         self.pending_release = {}
         self.moving = False
         self.command_held = set()
+        self.stopped = False
         self.lines = queue.Queue()
 
-        self.ser = serial.Serial(port, 115200, timeout=0.1)
+        # DTR/RTS held off so opening the port doesn't reset the Mega, which
+        # would re-run setup() and home Z again.
+        self.ser = serial.Serial()
+        self.ser.port = port
+        self.ser.baudrate = 115200
+        self.ser.timeout = 0.1
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.open()
         threading.Thread(target=self.read_serial, daemon=True).start()
 
         root.title(f"SCARA jog ({port})")
@@ -57,9 +66,12 @@ class Jog:
         )
         tk.Label(
             root,
-            text="Arrows: X/Y   W/S: Z   F: flip elbow   O/C: gripper   Space: stop   H: home Z",
+            text="Arrows: X/Y   W/S: Z   F: flip elbow   O/C: gripper   Space: stop/resume   H: home Z",
             font=("Consolas", 10),
         ).pack(padx=10, anchor="w")
+        self.stop_label = tk.Label(root, font=("Consolas", 14, "bold"), fg="white")
+        self.stop_label.pack(padx=10, pady=(4, 0), anchor="w")
+        self.show_stopped()
         self.log = tk.Text(root, height=10, width=60, font=("Consolas", 10), state="disabled")
         self.log.pack(padx=10, pady=10, fill="both", expand=True)
 
@@ -78,12 +90,18 @@ class Jog:
         k = self.key_name(event)
         if k in self.pending_release:
             self.root.after_cancel(self.pending_release.pop(k))
+        if k == "space":
+            if k not in self.command_held:
+                self.toggle_stop()
+                self.command_held.add(k)
+            return
+        if self.stopped:
+            return
         if k in KEY_AXES:
             self.held.add(k)
-        elif k == "space":
+        elif k == "h" and k not in self.command_held:
             self.stop()
-        elif k == "h":
-            self.stop()
+            self.command_held.add(k)
             self.send("H")
         elif k in KEY_COMMANDS and k not in self.command_held:
             self.command_held.add(k)
@@ -91,8 +109,7 @@ class Jog:
 
     def on_release(self, event):
         k = self.key_name(event)
-        self.command_held.discard(k)
-        if k in KEY_AXES and k not in self.pending_release:
+        if (k in KEY_AXES or k in self.command_held) and k not in self.pending_release:
             self.pending_release[k] = self.root.after(
                 RELEASE_DEBOUNCE_MS, lambda: self.release(k)
             )
@@ -100,6 +117,21 @@ class Jog:
     def release(self, k):
         self.pending_release.pop(k, None)
         self.held.discard(k)
+        self.command_held.discard(k)
+
+    def toggle_stop(self):
+        if self.stopped:
+            self.stopped = False
+        else:
+            self.stop()
+            self.stopped = True
+        self.show_stopped()
+
+    def show_stopped(self):
+        if self.stopped:
+            self.stop_label.configure(text=" STOPPED - Space to resume ", bg="red")
+        else:
+            self.stop_label.configure(text=" RUNNING - Space to stop ", bg="green")
 
     def stop(self):
         for after_id in self.pending_release.values():

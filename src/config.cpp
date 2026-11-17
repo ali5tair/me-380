@@ -1,3 +1,4 @@
+#include <EEPROM.h>
 #include <SCServo.h>
 
 // Servo setup and test over USB serial (115200). IDs are set with set-id.cpp.
@@ -11,6 +12,7 @@
 //   w  sweep one servo +/-20 deg
 //   h  spin one servo 180 deg
 //   p  print positions of all servos
+//   z  Z top limit switch: live read until a key is pressed
 //   d  bus diagnostics (line levels, passive listen, raw ping, edges, motion)
 
 // Servo driver is on Serial2 (TX2 = pin 16 = PH1, RX2 = pin 17 = PH0).
@@ -27,6 +29,16 @@ static const byte ELBOW_ID = 2;
 static const byte GRIPPER_ID = 3;
 static const byte JOINT_IDS[] = {SHOULDER_ID, ELBOW_ID};
 static const byte ALL_IDS[] = {SHOULDER_ID, ELBOW_ID, GRIPPER_ID};
+
+// MCU EEPROM layout shared with main.cpp / manual.cpp.
+static const int GRIPPER_EEPROM_ADDR = 0;
+static const uint16_t GRIPPER_EEPROM_MAGIC = 0x4731; // 'G' '1'
+
+struct GripperEeprom {
+  uint16_t magic;
+  uint16_t open;
+  uint16_t close;
+};
 
 static const int CENTER = 2048;
 static const int COUNTS_PER_REV = 4096;
@@ -55,6 +67,10 @@ static const unsigned long DIAG_BAUDS[] = {1000000, 500000, 250000, 128000,
 // must match Z_EN_PIN in manual.cpp.
 static const byte Z_EN_PIN = 4;
 static const byte Z_ENABLED_LEVEL = LOW;
+// Top limit switch, normally closed to GND (INPUT_PULLUP). Open / broken wire
+// reads HIGH = pressed. Must match Z_HOME_PIN in main.cpp / manual.cpp.
+static const byte Z_HOME_PIN = 8;
+static const byte Z_SWITCH_PRESSED = HIGH;
 
 static const byte BROADCAST_ID = 0xFE;
 static const int SCAN_MAX_ID = 20;
@@ -365,10 +381,13 @@ static void gripperLimits()
       writeLimits(GRIPPER_ID, min(open, close), max(open, close));
       printId(GRIPPER_ID);
       printLimits(GRIPPER_ID);
-      Serial.print(F("For firmware: GRIPPER_OPEN = "));
+      GripperEeprom slot = {GRIPPER_EEPROM_MAGIC, (uint16_t)open, (uint16_t)close};
+      EEPROM.put(GRIPPER_EEPROM_ADDR, slot);
+      Serial.print(F("Saved open="));
       Serial.print(open);
-      Serial.print(F(", GRIPPER_CLOSE = "));
-      Serial.println(close);
+      Serial.print(F(" close="));
+      Serial.print(close);
+      Serial.println(F(" to MCU EEPROM (main/manual load these on boot)."));
       return;
     }
 
@@ -824,6 +843,32 @@ static void cmdDiagnose()
   }
 }
 
+// Live-reads the Z top limit switch. NC to GND: released = LOW, pressed /
+// missing / broken wire = HIGH. Press any key to stop.
+static void cmdLimitSwitch()
+{
+  Serial.println(F("Z limit switch (pin 8, NC to GND, INPUT_PULLUP)."));
+  Serial.println(F("Released should read LOW / open. Pressed (or open circuit) "
+                   "should read HIGH / pressed."));
+  Serial.println(F("Press and release the switch; any key stops."));
+  flushInput();
+  int last = -1;
+  while (!Serial.available()) {
+    int raw = digitalRead(Z_HOME_PIN);
+    if (raw != last) {
+      last = raw;
+      Serial.print(F("  pin="));
+      Serial.print(raw);
+      Serial.print(raw == LOW ? F(" LOW") : F(" HIGH"));
+      Serial.print(F(" -> "));
+      Serial.println(raw == Z_SWITCH_PRESSED ? F("PRESSED") : F("open"));
+    }
+    delay(10);
+  }
+  flushInput();
+  Serial.println(F("Stopped."));
+}
+
 // ----------------------------------------------------------------
 
 static void printMenu()
@@ -831,7 +876,7 @@ static void printMenu()
   Serial.println();
   Serial.println(F("s scan | q bus quality | t torque off | c calibrate centre | "
                    "l angle limits | j jog | w sweep | h spin 180 | p positions | "
-                   "d diagnostics"));
+                   "z limit switch | d diagnostics"));
 }
 
 void setup()
@@ -839,6 +884,7 @@ void setup()
   Serial.begin(115200);
   digitalWrite(Z_EN_PIN, Z_ENABLED_LEVEL);
   pinMode(Z_EN_PIN, OUTPUT);
+  pinMode(Z_HOME_PIN, INPUT_PULLUP);
   Serial2.begin(BUS_BAUD);
   st.pSerial = &Serial2;
   st.IOTimeOut = 5;
@@ -861,6 +907,7 @@ void loop()
   case 'w': cmdSweep(); break;
   case 'h': cmdSpin(); break;
   case 'p': cmdPositions(); break;
+  case 'z': cmdLimitSwitch(); break;
   case 'd': cmdDiagnose(); break;
   default: return;
   }

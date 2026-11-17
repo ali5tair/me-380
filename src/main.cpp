@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <SCServo.h>
 #include <limits.h>
 #include <math.h>
@@ -12,11 +13,14 @@
 //
 // Frames and joint conventions are the same as manual.cpp: table frame XY in
 // mm with the origin on the shoulder axis, +Y along the base plate's forward
-// edge. Z is the carriage position, 0 at the top and negative going down.
+// edge. Z is the carriage position, 0 at the top switch and negative going
+// down; after homing it never goes above Z_CEILING_MM.
 //
 // Each move is planned before it starts: minimum-jerk profiles in XY and Z,
 // overlapped where the box allows, then sampled to check reach, joint limits,
 // joint speed and box clearance. A move that fails the checks is not run.
+// XY moves arc around the shoulder (radius and angle interpolated): a straight
+// line from PICK to PLACE would pass inside the arm's minimum reach.
 
 struct Point {
   float x, y;
@@ -24,8 +28,10 @@ struct Point {
 
 // ---------------------------------------------------------------- task
 
-static const Point PICK = {148.73, 81.8};  // table frame, mm
-static const Point PLACE = {39.2, 169.5}; // box centre, table frame, mm
+static const Point PICK = {133.73, 81.8};  // table frame, mm
+// Box centre, table frame, mm. Shifted 15 mm toward the base along a line
+// 14.155 deg CW of +Y (delta ≈ -3.67, -14.54).
+static const Point PLACE = {-42.87, 154.96};
 
 static const float MM_PER_INCH = 25.4;
 static const float TARGET_HEIGHTS_IN[] = {0.5, 2.0, 4.0};
@@ -40,29 +46,40 @@ static const float GRIPPER_RADIUS_MM = 45.0;
 // except for the final vertical drop at PLACE.
 static const float BOX_CLEARANCE_MM = 20.0;
 static const float PLACE_XY_TOL_MM = 1.0;
+// The final straight-down approach may start once XY is this close to its
+// target. Below PLACE_XY_TOL_MM, since the planner estimates the distance
+// left from the arc length.
+static const float ARRIVE_TOL_MM = 0.5;
 // Lowest travel height, so the gripper passes over the part at PICK.
 static const float CRUISE_MIN_MM = 40.0;
 // Straight up before moving sideways, and straight down for the last stretch.
 static const float LIFT_CLEAR_MM = 30.0;
 static const float PICK_APPROACH_MM = 40.0;
 static const float PLACE_APPROACH_MM = 15.0;
+// After the release the gripper rises to travel height, but at least this far
+// above the top of the cube sitting on the box, before dancing over it.
+static const float CUBE_HEIGHT_MM = 20.0;
+static const float CUBE_CLEARANCE_MM = 10.0;
 
-static const unsigned long GRIP_WAIT_MS = 800;
+// Gripper waits end when the servo reports it has stopped (or stalled on the
+// part), but no sooner than GRIP_MIN_MS and no later than GRIP_TIMEOUT_MS.
+static const unsigned long GRIP_MIN_MS = 100;
+static const unsigned long GRIP_TIMEOUT_MS = 800;
+static const unsigned long GRIP_POLL_MS = 10;
 
-// Wiggle dance: figure-8 in XY with a Z bob, then gripper claps.
-static const float WIGGLE_SIZE_MM = 15.0;
-static const float WIGGLE_LOOPS = 2;
-static const float WIGGLE_TIME_S = 4.0;
+// Wiggle dance: figure-8 in XY with a Z bob.
+static const float WIGGLE_SIZE_MM = 30.0; // width; the height is half of it
+static const float WIGGLE_LOOPS = 1;
+static const float WIGGLE_TIME_S = 3.0;
+// Easing from rest to the steady loop speed, and back.
+static const float WIGGLE_RAMP_S = 0.75;
 static const float WIGGLE_BOB_MM = 8.0;
-static const byte CLAPS = 2;
-static const unsigned long CLAP_MS = 400;
-
 // ---------------------------------------------------------------- motion
 
-static const float XY_SPEED = 80.0;  // mm/s, peak
-static const float XY_ACC = 300.0;   // mm/s^2, peak
-static const float Z_SPEED = 40.0;   // mm/s, peak
-static const float Z_ACC = 100.0;    // mm/s^2, peak
+static const float XY_SPEED = 200.0;  // mm/s, peak
+static const float XY_ACC = 1000.0;   // mm/s^2, peak
+static const float Z_SPEED = 60.0;   // mm/s, peak
+static const float Z_ACC = 200.0;    // mm/s^2, peak
 // Joint-space move from the power-up pose.
 static const float JOINT_SPEED_DEG = 60.0;
 static const float JOINT_ACC_DEG = 200.0;
@@ -81,9 +98,17 @@ static const unsigned long Z_TICK_MS = 5;
 // Z steps toward where the trajectory will be this far ahead.
 static const float Z_LEAD_S = 0.02;
 static const float Z_RATE_MARGIN = 1.5;
+// Servo goals are sent this far ahead along the trajectory.
+static const float JOINT_LEAD_S = 0.04;
 static const float Z_SETTLE_SPEED = 2.0; // mm/s
 static const unsigned long Z_SETTLE_TIMEOUT_MS = 3000;
-static const unsigned long SERVO_SETTLE_MS = 100;
+// After each move, both joints must read back within ARM_ARRIVE_COUNTS of the
+// final goal before anything else happens; the remaining gap is closed in
+// about ARM_CATCHUP_S.
+static const int ARM_ARRIVE_COUNTS = 2;
+static const float ARM_CATCHUP_S = 0.1;
+static const unsigned long ARM_ARRIVE_TIMEOUT_MS = 600;
+static const unsigned long ARM_POLL_MS = 10;
 
 // ---------------------------------------------------------------- arm
 
@@ -117,17 +142,23 @@ static const float ELBOW_MIN_BEND_DEG = 2.0;
 // Speed 0 means full speed to the servo, so never send it.
 static const u16 MIN_SERVO_SPEED = 50;   // counts/s
 static const u16 MAX_SERVO_SPEED = 3400; // counts/s
-static const float SERVO_SPEED_MARGIN = 1.25;
 
 static const byte READ_TRIES = 5;
 
 // ---------------------------------------------------------------- gripper
 
 static const byte GRIPPER_ID = 3;
-// Copy from the "For firmware:" line printed by config.cpp 'l'.
-static const int GRIPPER_OPEN = 3834;
-static const int GRIPPER_CLOSE = 3409;
-static const u16 GRIPPER_SPEED = 1000; // counts/s
+// Taught by config.cpp 'l' into MCU EEPROM (same layout as config/manual).
+static const int GRIPPER_EEPROM_ADDR = 0;
+static const uint16_t GRIPPER_EEPROM_MAGIC = 0x4731; // 'G' '1'
+struct GripperEeprom {
+  uint16_t magic;
+  uint16_t open;
+  uint16_t close;
+};
+static int gripperOpen = 0;
+static int gripperClose = 0;
+static const u16 GRIPPER_SPEED = 1500; // counts/s
 static const byte GRIPPER_ACC = 50;
 
 // ---------------------------------------------------------------- Z
@@ -151,6 +182,8 @@ static const float STEPS_PER_MM = PULSES_PER_REV / LEAD_MM;
 static const float Z_TRAVEL_MM = 150.0;
 static const float Z_MAX_MM = 0.0;
 static const float Z_MIN_MM = -Z_TRAVEL_MM;
+// Highest Z after homing, so motion never presses the switch.
+static const float Z_CEILING_MM = -10.0;
 // Gripper bottom above the table at Z_MAX_MM; at Z_MIN_MM it is on the table.
 static const float GRIP_HEIGHT_AT_TOP_MM = Z_TRAVEL_MM;
 // Switch contact point to gripper bottom, measured vertically.
@@ -159,9 +192,7 @@ static const float SWITCH_TO_GRIP_MM = 94.6;
 static const unsigned int STEP_PULSE_US = 5;
 static const unsigned int DIR_SETUP_US = 10;
 
-static const float Z_HOME_FAST = 10.0;   // mm/s
-static const float Z_HOME_SLOW = 1.0;    // mm/s
-static const float Z_HOME_BACKOFF = 2.0; // mm
+static const float Z_HOME_SPEED = 5.0; // mm/s
 // Step down this far with the switch reading pressed: if it is still
 // pressed, there is no switch.
 static const float Z_PROBE_MM = 3.0;
@@ -187,7 +218,6 @@ static bool ready = false;
 static bool armPlaced = false;
 static bool gripperReady = false;
 static float curT1 = 0, curT2 = 0; // commanded joint angles, deg
-static s16 curCounts[2] = {CENTER, CENTER};
 static Point curPos = {0, L1 + L2}; // table frame
 static float curZ = 0;
 static float boxTop = 0; // box top above the table, mm
@@ -310,22 +340,28 @@ static int readWordRetry(byte id, byte addr)
   return -1;
 }
 
-// Streams one tick's worth of motion: speed is set so each joint arrives
-// about when the next goal is sent.
-static void sendJoints(float t1, float t2)
+// q is the trajectory JOINT_LEAD_S ahead of qNow. Each servo is sent q as its
+// goal at the trajectory's own speed, so it is always still travelling when
+// the next goal arrives instead of reaching each goal and pausing.
+static void jointCounts(const float q[2], s16 counts[2])
 {
-  s16 target[2] = {toCounts(t1, SHOULDER_SIGN, SHOULDER_EEPROM_COUNTS),
-                   toCounts(t2, ELBOW_SIGN, ELBOW_EEPROM_COUNTS)};
+  counts[0] = toCounts(q[0], SHOULDER_SIGN, SHOULDER_EEPROM_COUNTS);
+  counts[1] = toCounts(q[1], ELBOW_SIGN, ELBOW_EEPROM_COUNTS);
+}
+
+static void sendJoints(const float q[2], const float qNow[2])
+{
+  s16 target[2];
+  jointCounts(q, target);
   u16 speed[2];
   u8 acc[2] = {0, 0};
   for (byte i = 0; i < 2; i++) {
-    float cps = abs(target[i] - curCounts[i]) * (1000.0 / TICK_MS) * SERVO_SPEED_MARGIN;
+    float cps = fabs(q[i] - qNow[i]) * COUNTS_PER_DEG / JOINT_LEAD_S;
     speed[i] = (u16)constrain(cps, MIN_SERVO_SPEED, MAX_SERVO_SPEED);
-    curCounts[i] = target[i];
   }
   st.SyncWritePosEx(jointIds, 2, target, speed, acc);
-  curT1 = t1;
-  curT2 = t2;
+  curT1 = q[0];
+  curT2 = q[1];
 }
 
 static bool initArm()
@@ -343,7 +379,6 @@ static bool initArm()
   for (byte i = 0; i < 2; i++) {
     st.WritePosEx(jointIds[i], raw[i], MIN_SERVO_SPEED, 0);
     st.EnableTorque(jointIds[i], 1);
-    curCounts[i] = raw[i];
   }
   curT1 = SHOULDER_SIGN * (raw[0] - CENTER) / COUNTS_PER_DEG;
   curT2 = ELBOW_SIGN * (raw[1] - CENTER) / COUNTS_PER_DEG;
@@ -371,10 +406,16 @@ static void initGripper()
     Serial.println(F("Gripper angle limit read failed; running without it"));
     return;
   }
-  if (min(GRIPPER_OPEN, GRIPPER_CLOSE) < lo || max(GRIPPER_OPEN, GRIPPER_CLOSE) > hi) {
-    Serial.println(F("Gripper open/close are outside its angle limits; re-run config.cpp 'l'"));
+  GripperEeprom slot;
+  EEPROM.get(GRIPPER_EEPROM_ADDR, slot);
+  if (slot.magic != GRIPPER_EEPROM_MAGIC || slot.open == slot.close ||
+      !((slot.open == (uint16_t)lo && slot.close == (uint16_t)hi) ||
+        (slot.open == (uint16_t)hi && slot.close == (uint16_t)lo))) {
+    Serial.println(F("Gripper open/close missing or mismatched; run config.cpp 'l'"));
     return;
   }
+  gripperOpen = slot.open;
+  gripperClose = slot.close;
   st.WritePosEx(GRIPPER_ID, raw, MIN_SERVO_SPEED, 0);
   st.EnableTorque(GRIPPER_ID, 1);
   gripperReady = true;
@@ -457,7 +498,7 @@ static void setZLimits(long lo, long hi)
 
 static void setTravelLimits()
 {
-  setZLimits(lround(Z_MIN_MM * STEPS_PER_MM), lround(Z_MAX_MM * STEPS_PER_MM));
+  setZLimits(lround(Z_MIN_MM * STEPS_PER_MM), lround(Z_CEILING_MM * STEPS_PER_MM));
 }
 
 // Signed steps/s, positive = up. The ISR enforces the soft limits.
@@ -554,38 +595,31 @@ static void moveZBy(float mm, float speed)
   setZRate(0);
 }
 
+// Up to the first click of the switch, then down to Z_CEILING_MM.
 static bool homeZ()
 {
   setZLimits(LONG_MIN, LONG_MAX);
-  bool ok;
+  switchPresent = true;
   if (zSwitchPressed()) {
     // Either already at the top, or no switch (which also reads pressed).
     switchPresent = false;
-    moveZBy(-Z_PROBE_MM, Z_HOME_FAST);
-    if (zSwitchPressed()) {
-      moveZBy(Z_PROBE_MM, Z_HOME_FAST);
-      setZSteps(lround(Z_MAX_MM * STEPS_PER_MM));
-      setTravelLimits();
+    moveZBy(-Z_PROBE_MM, Z_HOME_SPEED);
+    switchPresent = !zSwitchPressed();
+    if (!switchPresent) {
+      moveZBy(Z_PROBE_MM, Z_HOME_SPEED);
       Serial.println(F("No Z switch: assuming Z started at the top"));
-      return true;
-    }
-    switchPresent = true;
-    ok = seekSwitch(Z_HOME_SLOW, Z_PROBE_MM * 2);
-  } else {
-    switchPresent = true;
-    Serial.println(F("Homing Z"));
-    ok = seekSwitch(Z_HOME_FAST, Z_TRAVEL_MM + 10);
-    if (ok) {
-      moveZBy(-Z_HOME_BACKOFF, Z_HOME_FAST);
-      ok = seekSwitch(Z_HOME_SLOW, Z_HOME_BACKOFF * 2);
     }
   }
-  if (!ok) {
-    Serial.println(F("Z switch not found; Z position unknown"));
-    return false;
+  if (switchPresent) {
+    Serial.println(F("Homing Z"));
+    if (!seekSwitch(Z_HOME_SPEED, Z_TRAVEL_MM + 10)) {
+      Serial.println(F("Z switch not found; Z position unknown"));
+      return false;
+    }
   }
   setZSteps(lround(Z_MAX_MM * STEPS_PER_MM));
   setTravelLimits();
+  moveZBy(Z_CEILING_MM - Z_MAX_MM, Z_HOME_SPEED);
   Serial.println(F("Z homed"));
   return true;
 }
@@ -636,23 +670,45 @@ static float durationFor(float d, float vmax, float amax)
 
 enum TrajKind : byte { TRANSFER, JOINT_MOVE, WIGGLE };
 
-// TRANSFER: XY in a straight line a -> c; Z up za -> zs, then down zs -> zc.
+// TRANSFER: XY arcs a -> c around the shoulder; Z up za -> zs, then down zs -> zc.
 // JOINT_MOVE: joints j0 -> j1 at constant za.
-// WIGGLE: figure-8 around a, Z bobbing below za.
+// WIGGLE: figure-8 around a, Z bobbing above za.
 struct Traj {
   TrajKind kind;
   float T;
   Point a, c;
+  float ra, rc, tha, dth; // polar a and c, table frame
   float za, zs, zc;
   float tUp, Tup, tXy, Txy, tDown, Tdown;
   float j0[2], j1[2];
 };
 
-static Traj traj;
+// Two buffers, so a move can be planned before the one ahead of it has run.
+static Traj trajA, trajB;
 
+// Eases up to a steady loop speed over WIGGLE_RAMP_S, holds it, and eases back
+// down, with continuous acceleration throughout, so every loop is traced at
+// the same speed.
 static float wigglePhase(const Traj &tr, float t)
 {
-  return TWO_PI * WIGGLE_LOOPS * mj(t, 0, tr.T);
+  float total = TWO_PI * WIGGLE_LOOPS;
+  float ramp = min(WIGGLE_RAMP_S, tr.T / 2);
+  float w = total / (tr.T - ramp);
+  if (t <= 0) {
+    return 0;
+  }
+  if (t >= tr.T) {
+    return total;
+  }
+  if (t < ramp) {
+    float x = t / ramp;
+    return w * ramp * x * x * x * (1 - x / 2);
+  }
+  if (t > tr.T - ramp) {
+    float x = (tr.T - t) / ramp;
+    return total - w * ramp * x * x * x * (1 - x / 2);
+  }
+  return w * (t - ramp / 2);
 }
 
 static Point trajXY(const Traj &tr, float t)
@@ -663,7 +719,9 @@ static Point trajXY(const Traj &tr, float t)
     return {tr.a.x + amp * sin(phi), tr.a.y + amp / 2 * sin(2 * phi)};
   }
   float s = mj(t, tr.tXy, tr.Txy);
-  return {tr.a.x + (tr.c.x - tr.a.x) * s, tr.a.y + (tr.c.y - tr.a.y) * s};
+  float r = tr.ra + (tr.rc - tr.ra) * s;
+  float th = tr.tha + tr.dth * s;
+  return {r * cos(th), r * sin(th)};
 }
 
 static float trajZ(const Traj &tr, float t)
@@ -672,7 +730,7 @@ static float trajZ(const Traj &tr, float t)
   case TRANSFER:
     return tr.za + (tr.zs - tr.za) * mj(t, tr.tUp, tr.Tup) -
            (tr.zs - tr.zc) * mj(t, tr.tDown, tr.Tdown);
-  case WIGGLE: return tr.za - WIGGLE_BOB_MM * (1 - cos(wigglePhase(tr, t))) / 2;
+  case WIGGLE: return tr.za + WIGGLE_BOB_MM * (1 - cos(wigglePhase(tr, t))) / 2;
   default: return tr.za;
   }
 }
@@ -700,7 +758,7 @@ static Check checkTraj(const Traj &tr, float &speedRatio)
   for (int i = 0; i <= n; i++) {
     float t = i * dt;
     float z = trajZ(tr, t);
-    if (z < Z_MIN_MM - CHECK_EPS_MM || z > Z_MAX_MM + CHECK_EPS_MM) {
+    if (z < Z_MIN_MM - CHECK_EPS_MM || z > Z_CEILING_MM + CHECK_EPS_MM) {
       return CHECK_REACH;
     }
     float q[2];
@@ -754,9 +812,18 @@ static bool finishPlan(Traj &tr)
   return true;
 }
 
-static bool planJointMove(float t1, float t2)
+// Where a trajectory finishes, table frame.
+static void trajEnd(const Traj &tr, Point &p, float &z)
 {
-  Traj &tr = traj;
+  float t1, t2;
+  trajJoints(tr, tr.T, t1, t2);
+  p = robotToTable(fk(t1, t2));
+  z = trajZ(tr, tr.T);
+}
+
+// From the current joints, at constant Z.
+static bool planJointMove(Traj &tr, float t1, float t2)
+{
   tr.kind = JOINT_MOVE;
   tr.j0[0] = curT1;
   tr.j0[1] = curT2;
@@ -767,30 +834,33 @@ static bool planJointMove(float t1, float t2)
   return finishPlan(tr);
 }
 
-static bool planWiggle()
+static bool planWiggle(Traj &tr, Point centre, float z)
 {
-  Traj &tr = traj;
   tr.kind = WIGGLE;
-  tr.a = curPos;
-  tr.za = curZ;
+  tr.a = centre;
+  tr.za = z;
   tr.T = WIGGLE_TIME_S;
   return finishPlan(tr);
 }
 
-// From the current position to c at carriage height zc, travelling no lower
-// than zs. The first liftClear of the climb and the last approach of the
-// descent are straight up and down. XY starts as early as the climb allows and
-// the descent as early as XY allows; if that cuts across the box, the overlap
-// is reduced step by step down to plain up-across-down.
-static bool planTransfer(Point c, float zc, float zs, float liftClear, float approach)
+// From a at carriage height za to c at zc, travelling no lower than zs. The
+// first liftClear of the climb and the last approach of the descent are
+// straight up and down. XY starts as early as the climb allows and the descent
+// as early as XY allows; if that cuts across the box, the overlap is reduced
+// step by step down to plain up-across-down.
+static bool planTransfer(Traj &tr, Point a, float za, Point c, float zc, float zs,
+                         float liftClear, float approach)
 {
-  Traj &tr = traj;
   tr.kind = TRANSFER;
-  tr.a = curPos;
-  tr.za = curZ;
+  tr.a = a;
+  tr.za = za;
   tr.c = c;
   tr.zc = zc;
-  tr.zs = min(Z_MAX_MM, max(zs, max(tr.za, zc + approach)));
+  tr.ra = hypot(tr.a.x, tr.a.y);
+  tr.rc = hypot(c.x, c.y);
+  tr.tha = atan2(tr.a.y, tr.a.x);
+  tr.dth = wrapPi(atan2(c.y, c.x) - tr.tha);
+  tr.zs = min(Z_CEILING_MM, max(zs, max(tr.za, zc + approach)));
   float up = tr.zs - tr.za;
   float down = tr.zs - tr.zc;
   tr.tUp = 0;
@@ -798,7 +868,10 @@ static bool planTransfer(Point c, float zc, float zs, float liftClear, float app
   tr.Tdown = durationFor(down, Z_SPEED, Z_ACC);
   float tLift = up > 0 ? tr.Tup * minJerkInv(min(liftClear, up) / up) : 0;
   float tReach = down > approach ? tr.Tdown * minJerkInv((down - approach) / down) : 0;
-  float xyTime = durationFor(hypot(c.x - tr.a.x, c.y - tr.a.y), XY_SPEED, XY_ACC);
+  float arcLen = hypot(tr.rc - tr.ra, (tr.ra + tr.rc) / 2 * tr.dth);
+  float xyTime = durationFor(arcLen, XY_SPEED, XY_ACC);
+  // Fraction of the XY move after which it is within ARRIVE_TOL_MM of c.
+  float nearFrac = arcLen > ARRIVE_TOL_MM ? minJerkInv(1 - ARRIVE_TOL_MM / arcLen) : 0;
 
   Check r = CHECK_BOX;
   for (int k = OVERLAP_STEPS; k >= 0; k--) {
@@ -807,9 +880,10 @@ static bool planTransfer(Point c, float zc, float zs, float liftClear, float app
     for (byte i = 0; i < SPEED_RETRIES; i++) {
       tr.tXy = tLift + (1 - overlap) * (tr.Tup - tLift);
       float xyEnd = tr.tXy + tr.Txy;
+      float xyNear = tr.tXy + tr.Txy * nearFrac;
       // The descent never overlaps the climb, so the last `approach` of it
-      // only starts once XY has arrived.
-      tr.tDown = max(tr.Tup, xyEnd - overlap * tReach);
+      // only starts once XY has all but arrived.
+      tr.tDown = max(tr.Tup, xyNear - overlap * tReach);
       tr.T = max(xyEnd, tr.tDown + tr.Tdown);
       float ratio;
       r = checkTraj(tr, ratio);
@@ -852,7 +926,7 @@ static void settleZ(long target)
   if (up) {
     setZLimits(lround(Z_MIN_MM * STEPS_PER_MM), target);
   } else {
-    setZLimits(target, lround(Z_MAX_MM * STEPS_PER_MM));
+    setZLimits(target, lround(Z_CEILING_MM * STEPS_PER_MM));
   }
   setZRate((up ? Z_SETTLE_SPEED : -Z_SETTLE_SPEED) * STEPS_PER_MM);
   unsigned long start = millis();
@@ -866,9 +940,43 @@ static void settleZ(long target)
   setTravelLimits();
 }
 
-static void runTraj()
+// The servos trail the trajectory, and its last goal goes out at the
+// trajectory's near-zero end speed, so whatever gap is left would close at
+// MIN_SERVO_SPEED. Re-sends that goal fast enough to close the gap, then waits
+// until both joints read back there.
+static void waitArm()
 {
-  const Traj &tr = traj;
+  float q[2] = {curT1, curT2};
+  s16 target[2];
+  jointCounts(q, target);
+  u8 acc[2] = {0, 0};
+  bool resent = false;
+  unsigned long start = millis();
+  while (millis() - start < ARM_ARRIVE_TIMEOUT_MS) {
+    pollAbort();
+    u16 speed[2];
+    int worst = 0;
+    bool read = true;
+    for (byte i = 0; i < 2 && read; i++) {
+      int pos = st.ReadPos(jointIds[i]);
+      read = pos >= 0;
+      int gap = abs(pos - target[i]);
+      worst = max(worst, gap);
+      speed[i] = (u16)constrain(gap / ARM_CATCHUP_S, MIN_SERVO_SPEED, MAX_SERVO_SPEED);
+    }
+    if (read && worst <= ARM_ARRIVE_COUNTS) {
+      return;
+    }
+    if (read && !resent) {
+      st.SyncWritePosEx(jointIds, 2, target, speed, acc);
+      resent = true;
+    }
+    waitMs(ARM_POLL_MS);
+  }
+}
+
+static void runTraj(const Traj &tr)
+{
   unsigned long t0 = millis();
   unsigned long lastTick = t0 - TICK_MS;
   unsigned long lastZ = t0 - Z_TICK_MS;
@@ -882,9 +990,10 @@ static void runTraj()
     }
     if (now - lastTick >= TICK_MS) {
       lastTick = now;
-      float t1, t2;
-      if (trajJoints(tr, min(t + TICK_MS / 1000.0, tr.T), t1, t2)) {
-        sendJoints(t1, t2);
+      float q[2], qNow[2];
+      if (trajJoints(tr, min(t + JOINT_LEAD_S, tr.T), q[0], q[1]) &&
+          trajJoints(tr, min(t, tr.T), qNow[0], qNow[1])) {
+        sendJoints(q, qNow);
       }
       if (t >= tr.T) {
         break;
@@ -893,28 +1002,47 @@ static void runTraj()
   }
   setZRate(0);
   settleZ(lround(trajZ(tr, tr.T) * STEPS_PER_MM));
-  waitMs(SERVO_SETTLE_MS);
+  waitArm();
   curPos = robotToTable(fk(curT1, curT2));
   curZ = readZSteps() / STEPS_PER_MM;
 }
 
-static void announce(const __FlashStringHelper *what)
+static void runMove(const __FlashStringHelper *what, const Traj &tr)
 {
   Serial.print(what);
   Serial.print(F(" ("));
-  Serial.print(traj.T, 1);
+  Serial.print(tr.T, 1);
   Serial.println(F(" s)"));
+  runTraj(tr);
 }
 
-static bool transferTo(const __FlashStringHelper *what, Point c, float zc, float zs,
-                       float liftClear, float approach)
+// ---------------------------------------------------------------- gripper waits
+
+static unsigned long gripStartMs = 0;
+
+// The next move is planned between startGripper and waitGripper, so the
+// planning time overlaps the gripper's travel.
+static void startGripper(int target)
 {
-  if (!planTransfer(c, zc, zs, liftClear, approach)) {
-    return false;
+  moveGripper(target);
+  gripStartMs = millis();
+}
+
+static void waitGripper()
+{
+  if (!gripperReady) {
+    return;
   }
-  announce(what);
-  runTraj();
-  return true;
+  while (millis() - gripStartMs < GRIP_MIN_MS) {
+    pollAbort();
+  }
+  while (millis() - gripStartMs < GRIP_TIMEOUT_MS) {
+    pollAbort();
+    if (st.ReadMove(GRIPPER_ID) == 0) {
+      return;
+    }
+    waitMs(GRIP_POLL_MS);
+  }
 }
 
 // ---------------------------------------------------------------- cycle
@@ -978,70 +1106,83 @@ static float cruiseHeightZ()
   return zForHeight(max(boxTop + BOX_CLEARANCE_MM, CRUISE_MIN_MM));
 }
 
-static bool goToPick()
+// The first time, swings in joint space from the power-up pose to above the
+// pick point (into trajA, at the current Z), then plans the descent onto the
+// part into trajB. Climbs to travel height first only if starting over the box.
+static bool planToPick()
 {
+  Point from = curPos;
+  float fromZ = curZ;
+  float travelZ = minHeightAt(from) > 0 ? cruiseHeightZ() : fromZ;
   if (!armPlaced) {
-    // From the power-up pose, swing in joint space to above the pick point,
-    // staying at the current Z.
     float t1, t2;
     if (!ikSolve(tableToRobot(PICK), ELBOW_DIR, t1, t2) || !jointsInLimits(t1, t2)) {
       reportCheck(CHECK_REACH);
       return false;
     }
-    if (!planJointMove(t1, t2)) {
+    if (!planJointMove(trajA, t1, t2)) {
       return false;
     }
-    announce(F("Swinging over the pick point"));
-    runTraj();
-    armPlaced = true;
+    trajEnd(trajA, from, fromZ);
   }
-  return transferTo(F("Moving down to the part"), PICK, Z_MIN_MM, cruiseHeightZ(),
-                    LIFT_CLEAR_MM, PICK_APPROACH_MM);
-}
-
-static bool wiggle()
-{
-  if (!planWiggle()) {
-    return false;
-  }
-  announce(F("Wiggle"));
-  runTraj();
-  for (byte i = 0; i < CLAPS; i++) {
-    moveGripper(GRIPPER_CLOSE);
-    waitMs(CLAP_MS);
-    moveGripper(GRIPPER_OPEN);
-    waitMs(CLAP_MS);
-  }
-  return true;
+  return planTransfer(trajB, from, fromZ, PICK, Z_MIN_MM, travelZ, LIFT_CLEAR_MM,
+                      PICK_APPROACH_MM);
 }
 
 static bool runCycle()
 {
+  float placeZ = zForHeight(boxTop + PLACE_LIFT_MM);
+  Point end;
+  float endZ;
+
   Serial.println(F("Opening gripper"));
-  moveGripper(GRIPPER_OPEN);
-  waitMs(GRIP_WAIT_MS);
-  if (!goToPick()) {
+  startGripper(gripperOpen);
+  if (!planToPick()) {
     return false;
   }
+  waitGripper();
+  if (!armPlaced) {
+    runMove(F("Swinging over the pick point"), trajA);
+    armPlaced = true;
+  }
+  runMove(F("Moving down to the part"), trajB);
 
   Serial.println(F("Gripping"));
-  moveGripper(GRIPPER_CLOSE);
-  waitMs(GRIP_WAIT_MS);
-
-  float placeZ = zForHeight(boxTop + PLACE_LIFT_MM);
-  if (!transferTo(F("Carrying to the box"), PLACE, placeZ, cruiseHeightZ(), LIFT_CLEAR_MM,
-                  PLACE_APPROACH_MM)) {
+  startGripper(gripperClose);
+  // The carry stops PLACE_APPROACH_MM above the drop, so the arm has settled
+  // over the target before the straight-down placement starts.
+  float hoverZ = placeZ + PLACE_APPROACH_MM;
+  trajEnd(trajB, end, endZ);
+  if (!planTransfer(trajA, end, endZ, PLACE, hoverZ, cruiseHeightZ(), LIFT_CLEAR_MM, 0) ||
+      !planTransfer(trajB, PLACE, hoverZ, PLACE, placeZ, hoverZ, 0, 0)) {
     return false;
   }
+  waitGripper();
+  runMove(F("Carrying to the box"), trajA);
+  runMove(F("Lowering onto the box"), trajB);
 
   Serial.println(F("Releasing"));
-  moveGripper(GRIPPER_OPEN);
-  waitMs(GRIP_WAIT_MS);
-
-  if (!transferTo(F("Rising"), curPos, Z_MAX_MM, Z_MAX_MM, 0, 0)) {
+  startGripper(gripperOpen);
+  float retreatZ = max(trajA.zs, zForHeight(boxTop + CUBE_HEIGHT_MM + CUBE_CLEARANCE_MM));
+  trajEnd(trajA, end, endZ);
+  if (!planTransfer(trajB, end, endZ, end, retreatZ, retreatZ, 0, 0)) {
     return false;
   }
-  return wiggle();
+  trajEnd(trajB, end, endZ);
+  if (!planWiggle(trajA, end, endZ)) {
+    return false;
+  }
+  waitGripper();
+  runMove(F("Rising"), trajB);
+  runMove(F("Wiggle"), trajA);
+
+  // Parks over the pick point, out of the way of the box, for the next cycle.
+  trajEnd(trajA, end, endZ);
+  if (!planTransfer(trajB, end, endZ, PICK, endZ, endZ, 0, 0)) {
+    return false;
+  }
+  runMove(F("Parking over the pick point"), trajB);
+  return true;
 }
 
 // ----------------------------------------------------------------

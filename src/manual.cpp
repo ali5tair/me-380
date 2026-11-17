@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <SCServo.h>
 #include <limits.h>
 #include <math.h>
@@ -89,10 +90,16 @@ static const byte READ_TRIES = 5;
 // ---------------------------------------------------------------- gripper
 
 static const byte GRIPPER_ID = 3;
-// Copy from the "For firmware:" line printed by config.cpp 'l'. While they
-// are equal the gripper stays disabled.
-static const int GRIPPER_OPEN = 3834;
-static const int GRIPPER_CLOSE = 3409;
+// Taught by config.cpp 'l' into MCU EEPROM (same layout as config/main).
+static const int GRIPPER_EEPROM_ADDR = 0;
+static const uint16_t GRIPPER_EEPROM_MAGIC = 0x4731; // 'G' '1'
+struct GripperEeprom {
+  uint16_t magic;
+  uint16_t open;
+  uint16_t close;
+};
+static int gripperOpen = 0;
+static int gripperClose = 0;
 static const u16 GRIPPER_SPEED = 1000; // counts/s
 static const byte GRIPPER_ACC = 50;
 
@@ -105,7 +112,7 @@ static const byte Z_UP_LEVEL = HIGH;
 
 // Top limit switch, normally closed to GND, so a broken wire reads as pressed.
 static const byte Z_HOME_PIN = 8;
-static const bool Z_HOME_ENABLED = false;
+static const bool Z_HOME_ENABLED = true;
 static const byte Z_SWITCH_PRESSED = HIGH;
 
 static const float LEAD_MM = 8.0;
@@ -120,9 +127,8 @@ static const float Z_TOOL_OFFSET = 0.0;
 static const unsigned int STEP_PULSE_US = 5;
 static const unsigned int DIR_SETUP_US = 10;
 
-static const float Z_HOME_FAST = 3.0;    // mm/s
-static const float Z_HOME_SLOW = 0.5;    // mm/s
-static const float Z_HOME_BACKOFF = 2.0; // mm
+static const float Z_HOME_SPEED = 5.0;    // mm/s
+static const float Z_HOME_CLEAR_MM = 5.0; // mm below the switch after home
 
 // Timer1 at /8 prescale: 2 MHz, so 65535 ticks (~31 steps/s) is the slowest rate.
 static const float TIMER_HZ = 2000000.0;
@@ -386,10 +392,6 @@ static bool initArm()
 // The arm still runs if this fails; O and C then reply with an error.
 static void initGripper()
 {
-  if (GRIPPER_OPEN == GRIPPER_CLOSE) {
-    Serial.println(F("E gripper positions not set; copy them from config.cpp 'l'"));
-    return;
-  }
   int raw = readPosRetry(GRIPPER_ID);
   if (raw < 0) {
     Serial.println(F("E gripper (ID 3) not responding"));
@@ -401,10 +403,16 @@ static void initGripper()
     Serial.println(F("E gripper angle limit read failed"));
     return;
   }
-  if (min(GRIPPER_OPEN, GRIPPER_CLOSE) < lo || max(GRIPPER_OPEN, GRIPPER_CLOSE) > hi) {
-    Serial.println(F("E gripper open/close are outside its angle limits; re-run config.cpp 'l'"));
+  GripperEeprom slot;
+  EEPROM.get(GRIPPER_EEPROM_ADDR, slot);
+  if (slot.magic != GRIPPER_EEPROM_MAGIC || slot.open == slot.close ||
+      !((slot.open == (uint16_t)lo && slot.close == (uint16_t)hi) ||
+        (slot.open == (uint16_t)hi && slot.close == (uint16_t)lo))) {
+    Serial.println(F("E gripper open/close missing or mismatched; run config.cpp 'l'"));
     return;
   }
+  gripperOpen = slot.open;
+  gripperClose = slot.close;
   st.WritePosEx(GRIPPER_ID, raw, MIN_SERVO_SPEED, 0);
   st.EnableTorque(GRIPPER_ID, 1);
   gripperReady = true;
@@ -555,18 +563,16 @@ static void homeZ()
   }
   Serial.println(F("I homing Z"));
   setZLimits(LONG_MIN, LONG_MAX);
-  bool ok = seekSwitch(Z_HOME_FAST, Z_TRAVEL_MM + 10);
-  if (ok) {
-    moveZDown(Z_HOME_BACKOFF, Z_HOME_FAST);
-    ok = seekSwitch(Z_HOME_SLOW, Z_HOME_BACKOFF * 2);
-  }
+  bool ok = seekSwitch(Z_HOME_SPEED, Z_TRAVEL_MM + 10);
   if (ok) {
     setZSteps(lround(Z_MAX_MM * STEPS_PER_MM));
+    setZLimits(lround(Z_MIN_MM * STEPS_PER_MM), lround(Z_MAX_MM * STEPS_PER_MM));
+    moveZDown(Z_HOME_CLEAR_MM, Z_HOME_SPEED);
     Serial.println(F("I Z homed"));
   } else {
     Serial.println(F("E Z switch not found; Z position unknown"));
+    setZLimits(lround(Z_MIN_MM * STEPS_PER_MM), lround(Z_MAX_MM * STEPS_PER_MM));
   }
-  setZLimits(lround(Z_MIN_MM * STEPS_PER_MM), lround(Z_MAX_MM * STEPS_PER_MM));
 }
 
 // ---------------------------------------------------------------- jog
@@ -785,8 +791,8 @@ static void handleLine(char *s)
     stopAll();
     homeZ();
     break;
-  case 'O': moveGripper(GRIPPER_OPEN); break;
-  case 'C': moveGripper(GRIPPER_CLOSE); break;
+  case 'O': moveGripper(gripperOpen); break;
+  case 'C': moveGripper(gripperClose); break;
   default: Serial.println(F("E unknown command")); break;
   }
 }

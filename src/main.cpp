@@ -76,10 +76,10 @@ static const float WIGGLE_RAMP_S = 0.75;
 static const float WIGGLE_BOB_MM = 8.0;
 // ---------------------------------------------------------------- motion
 
-static const float XY_SPEED = 200.0;  // mm/s, peak
+static const float XY_SPEED = 350.0;  // mm/s, peak
 static const float XY_ACC = 1000.0;   // mm/s^2, peak
-static const float Z_SPEED = 60.0;   // mm/s, peak
-static const float Z_ACC = 200.0;    // mm/s^2, peak
+static const float Z_SPEED = 250.0;   // mm/s, peak
+static const float Z_ACC = 300.0;    // mm/s^2, peak
 // Joint-space move from the power-up pose.
 static const float JOINT_SPEED_DEG = 60.0;
 static const float JOINT_ACC_DEG = 200.0;
@@ -109,6 +109,9 @@ static const int ARM_ARRIVE_COUNTS = 2;
 static const float ARM_CATCHUP_S = 0.1;
 static const unsigned long ARM_ARRIVE_TIMEOUT_MS = 600;
 static const unsigned long ARM_POLL_MS = 10;
+// A move that starts farther than this from where the arm is would jump.
+static const float START_TOL_MM = 1.0;
+static const float START_TOL_DEG = 1.0;
 
 // ---------------------------------------------------------------- arm
 
@@ -977,6 +980,12 @@ static void waitArm()
 
 static void runTraj(const Traj &tr)
 {
+  float q0[2];
+  if (fabs(trajZ(tr, 0) - curZ) > START_TOL_MM || !trajJoints(tr, 0, q0[0], q0[1]) ||
+      fabs(q0[0] - curT1) > START_TOL_DEG || fabs(q0[1] - curT2) > START_TOL_DEG) {
+    Serial.println(F("Move doesn't start where the arm is"));
+    halt();
+  }
   unsigned long t0 = millis();
   unsigned long lastTick = t0 - TICK_MS;
   unsigned long lastZ = t0 - Z_TICK_MS;
@@ -1164,8 +1173,7 @@ static bool runCycle()
   Serial.println(F("Releasing"));
   startGripper(gripperOpen);
   float retreatZ = max(trajA.zs, zForHeight(boxTop + CUBE_HEIGHT_MM + CUBE_CLEARANCE_MM));
-  trajEnd(trajA, end, endZ);
-  if (!planTransfer(trajB, end, endZ, end, retreatZ, retreatZ, 0, 0)) {
+  if (!planTransfer(trajB, curPos, curZ, curPos, retreatZ, retreatZ, 0, 0)) {
     return false;
   }
   trajEnd(trajB, end, endZ);
